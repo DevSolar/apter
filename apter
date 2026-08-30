@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # Colors (disabled if output is not a terminal or NO_COLOR is set)
 setup_colors() {
@@ -22,83 +22,6 @@ setup_colors() {
         COLOR_RED=""
         COLOR_DIM=""
         COLOR_RESET=""
-    fi
-}
-
-# Get path to world file based on XDG_CONFIG_HOME logic
-get_world_file() {
-    local config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}"
-    if [[ -d "$config_dir" ]]; then
-        mkdir -p "${config_dir}/apter"
-        echo "${config_dir}/apter/world"
-    else
-        echo "${HOME}/.apter_world"
-    fi
-}
-
-# Record successfully installed packages into world file
-add_to_world_file() {
-    local world_file
-    world_file=$(get_world_file)
-
-    local existing=()
-    if [[ -f "$world_file" ]]; then
-        while IFS= read -r line; do
-            [[ -n "$line" ]] && existing+=("$line")
-        done < "$world_file"
-    fi
-
-    declare -A seen
-    for p in "${existing[@]}"; do
-        [[ -n "$p" ]] && seen["$p"]=1
-    done
-
-    local newly_added=()
-    for pkg in "$@"; do
-        if [[ -z "${seen[$pkg]:-}" ]]; then
-            seen["$pkg"]=1
-            newly_added+=("$pkg")
-        fi
-    done
-
-    if [[ ${#newly_added[@]} -gt 0 ]]; then
-        printf "%s\n" "${!seen[@]}" | sort -u > "$world_file"
-        echo -e "${COLOR_GREEN}Recorded package(s) in world file (${world_file}).${COLOR_RESET}"
-    fi
-}
-
-# Remove uninstalled packages from world file
-remove_from_world_file() {
-    local world_file
-    world_file=$(get_world_file)
-
-    if [[ ! -f "$world_file" ]]; then
-        return 0
-    fi
-
-    declare -A to_remove
-    for p in "$@"; do
-        to_remove["$p"]=1
-    done
-
-    local remaining=()
-    local removed=()
-    while IFS= read -r line; do
-        [[ -z "$line" ]] && continue
-        if [[ -n "${to_remove[$line]:-}" ]]; then
-            removed+=("$line")
-        else
-            remaining+=("$line")
-        fi
-    done < "$world_file"
-
-    if [[ ${#removed[@]} -gt 0 ]]; then
-        if [[ ${#remaining[@]} -gt 0 ]]; then
-            printf "%s\n" "${remaining[@]}" | sort -u > "$world_file"
-        else
-            rm -f "$world_file"
-        fi
-        echo -e "${COLOR_YELLOW}Removed package(s) from world file (${world_file}): ${removed[*]}${COLOR_RESET}"
     fi
 }
 
@@ -183,13 +106,13 @@ apter v${VERSION} - Helper / porcelain for apt infrastructure
 Usage:
   apter search [options] <query>    Search for packages (anchored by default, supports globs)
   apter info <package|glob...>      Show clean description and version status (supports globs)
-  apter install [apt-opts] <pkg...> Install exact packages cleanly and record in world file
-  apter remove [apt-opts] <pkg...>  Remove exact packages cleanly and sync world file
-  apter world                       List packages recorded in your world file with status
+  apter install [apt-opts] <pkg...> Install exact packages cleanly
+  apter remove [apt-opts] <pkg...>  Remove exact packages cleanly
+  apter world                       List all manually installed packages (via apt-mark)
   apter update                      Quietly update apt package index
   apter upgrade [apt-opts]          List upgradable packages cleanly and perform upgrade
   apter orphans [options]           List or remove unneeded orphan dependency packages
-  apter who <file|command...>       Find package that installed a given file or command
+  apter who [options] <file|cmd...> Find package that installed a given file or command
   apter what <package|glob...>      List all files installed by package(s) (supports globs)
   apter history [options]           Display clean timeline of past package operations
   apter help                        Show this help message
@@ -199,13 +122,17 @@ Search options:
   -a, --all                         Broad/unanchored search (same scope as apt-cache search)
   -h, --help                        Show help for search command
 
+Who options:
+  -a, --all                         Search all repository packages (including uninstalled; requires apt-file)
+  -h, --help                        Show help for who command
+
 Examples:
   apter search clang                Search for 'clang' and versioned variants (e.g. clang-19)
   apter search 'clang-*'            Search using shell glob pattern matching
   apter info 'clang-1?'             Display description and version info for clang-14 .. clang-19
-  apter install sl htop             Install exact packages and track them in world file
-  apter remove sl                   Remove exact package and sync world file
-  apter world                       Show contents of your world file
+  apter install sl htop             Install exact packages cleanly
+  apter remove sl                   Remove exact package cleanly
+  apter world                       Show all manually installed packages on the system
   apter who /usr/bin/gcc            Find which package installed /usr/bin/gcc
   apter what adduser                List all files installed by package 'adduser'
   apter history -n 5                Show last 5 package operations in apt history
@@ -470,7 +397,6 @@ Usage: apter install [apt-options] <package...>
 
 Installs specified packages using apt-get. Wildcards are NOT allowed.
 Output is unlocalized (LC_ALL=C) and curbed to show clean package installation info only.
-Successfully installed package names are recorded in the apter world file.
 
 Options:
   -h, --help    Show this help message
@@ -503,9 +429,7 @@ EOF
         fi
     done
 
-    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
-        add_to_world_file "${pkgs[@]}"
-    else
+    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
         local status=$?
         echo "Installation failed." >&2
         return $status
@@ -536,7 +460,6 @@ Usage: apter remove [apt-options] <package...>
 
 Removes specified packages using apt-get. Wildcards are NOT allowed.
 Output is unlocalized (LC_ALL=C) and curbed to show clean removal info only.
-Successfully uninstalled package names are removed from the apter world file.
 
 Options:
   --purge       Remove configuration files as well
@@ -574,27 +497,22 @@ EOF
         action_flag="purge"
     fi
 
-    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
-        remove_from_world_file "${pkgs[@]}"
-    else
+    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
         local status=$?
         echo "Removal failed." >&2
         return $status
     fi
 }
 
-# World implementation
+# World implementation (dynamically queries apt-mark showmanual)
 cmd_world() {
-    local world_file
-    world_file=$(get_world_file)
-
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -h|--help)
                 cat <<EOF
 Usage: apter world
 
-Lists all packages recorded in your apter world file alongside their current status.
+Lists all manually installed packages on the system (via apt-mark showmanual) alongside their status.
 EOF
                 return 0
                 ;;
@@ -608,15 +526,18 @@ EOF
         esac
     done
 
-    if [[ ! -f "$world_file" ]] || [[ ! -s "$world_file" ]]; then
-        echo "World file ($world_file) is empty."
-        echo "Use 'apter install <package>' to add packages to your world file."
+    local pkgs=()
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && pkgs+=("$pkg")
+    done < <(apt-mark showmanual 2>/dev/null | sort -u || true)
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        echo "No manually installed packages found."
         return 0
     fi
 
-    echo -e "${COLOR_CYAN}World packages (${world_file}):${COLOR_RESET}"
-    while IFS= read -r pkg; do
-        [[ -z "$pkg" ]] && continue
+    echo -e "${COLOR_CYAN}World packages (${#pkgs[@]} manually installed via apt-mark):${COLOR_RESET}"
+    for pkg in "${pkgs[@]}"; do
         local policy_out
         policy_out=$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null || true)
         local installed_ver
@@ -641,7 +562,7 @@ EOF
         fi
 
         printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-16b %s\n" "$pkg" "$status_tag" "(${ver_info})"
-    done < "$world_file"
+    done
 }
 
 # Update implementation
@@ -827,20 +748,29 @@ EOF
 
 # Who implementation (file ownership)
 cmd_who() {
+    local search_all=false
     local files=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -a|--all)
+                search_all=true
+                shift
+                ;;
             -h|--help)
                 cat <<EOF
-Usage: apter who <file|command...>
+Usage: apter who [options] <file|command...>
 
-Shows which package installed the specified file or command.
+Shows which package installed (or provides) the specified file or command.
+
+Options:
+  -a, --all    Search among all repository packages (including uninstalled; requires apt-file)
+  -h, --help   Show this help message
 
 Examples:
   apter who /usr/bin/gcc
+  apter who -a /usr/bin/ninja
   apter who bash
-  apter who /etc/apt/sources.list
 EOF
                 return 0
                 ;;
@@ -861,6 +791,14 @@ EOF
         return 1
     fi
 
+    if [[ "$search_all" == true ]]; then
+        if ! command -v apt-file >/dev/null 2>&1; then
+            echo "Error: 'apt-file' is required to search uninstalled packages." >&2
+            echo "Tip: Install it using 'apter install apt-file' and update index ('sudo apt-file update' or 'sudo apt update')." >&2
+            return 1
+        fi
+    fi
+
     for target in "${files[@]}"; do
         local path_to_test="$target"
 
@@ -873,13 +811,27 @@ EOF
         fi
 
         local out=""
-        out=$(LC_ALL=C dpkg-query -S "$path_to_test" 2>/dev/null || true)
+        if [[ "$search_all" == true ]]; then
+            if [[ "$path_to_test" == /* ]]; then
+                out=$(LC_ALL=C apt-file search -F "$path_to_test" 2>/dev/null || true)
+            else
+                for p in "/usr/bin/$path_to_test" "/bin/$path_to_test" "/usr/sbin/$path_to_test" "/sbin/$path_to_test"; do
+                    out=$(LC_ALL=C apt-file search -F "$p" 2>/dev/null || true)
+                    [[ -n "$out" ]] && break
+                done
+                if [[ -z "$out" ]]; then
+                    out=$(LC_ALL=C apt-file search -F "$path_to_test" 2>/dev/null || true)
+                fi
+            fi
+        else
+            out=$(LC_ALL=C dpkg-query -S "$path_to_test" 2>/dev/null || true)
 
-        if [[ -z "$out" && -e "$path_to_test" ]]; then
-            local real_p
-            real_p=$(realpath "$path_to_test" 2>/dev/null || true)
-            if [[ -n "$real_p" && "$real_p" != "$path_to_test" ]]; then
-                out=$(LC_ALL=C dpkg-query -S "$real_p" 2>/dev/null || true)
+            if [[ -z "$out" && -e "$path_to_test" ]]; then
+                local real_p
+                real_p=$(realpath "$path_to_test" 2>/dev/null || true)
+                if [[ -n "$real_p" && "$real_p" != "$path_to_test" ]]; then
+                    out=$(LC_ALL=C dpkg-query -S "$real_p" 2>/dev/null || true)
+                fi
             fi
         fi
 
@@ -891,7 +843,11 @@ EOF
                 printf "  ${COLOR_CYAN}%s${COLOR_RESET} is owned by package ${COLOR_GREEN}%s${COLOR_RESET}\n" "$file_part" "$pkg_part"
             done <<< "$out"
         else
-            echo "  '$target' is not owned by any installed package."
+            if [[ "$search_all" == true ]]; then
+                echo "  '$target' was not found in any repository package."
+            else
+                echo "  '$target' is not owned by any installed package."
+            fi
         fi
     done
 }

@@ -63,9 +63,9 @@ apter purge sl                   # Uninstall package and purge configuration fil
 ```
 
 ### `apter world`
-Lists all packages recorded in your `world` file with their current status (`[installed]`, `[upgradable]`, or `[missing]`).
+Lists all manually installed packages on the system (dynamically queried from `apt-mark showmanual`) alongside their current status (`[installed]`, `[upgradable]`, or `[missing]`).
 ```bash
-apter world
+apter world                      # Show all manually installed packages on the system
 ```
 
 ### `apter update`
