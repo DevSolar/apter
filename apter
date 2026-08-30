@@ -1,0 +1,1123 @@
+#!/usr/bin/env bash
+# apter - Helper / porcelain for apt and apt-get infrastructure
+# Focuses on precise, noise-free, fast package search and management.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Colors (disabled if output is not a terminal or NO_COLOR is set)
+setup_colors() {
+    if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+        COLOR_CYAN="\033[1;36m"
+        COLOR_GREEN="\033[1;32m"
+        COLOR_YELLOW="\033[1;33m"
+        COLOR_RED="\033[1;31m"
+        COLOR_DIM="\033[2m"
+        COLOR_RESET="\033[0m"
+    else
+        COLOR_CYAN=""
+        COLOR_GREEN=""
+        COLOR_YELLOW=""
+        COLOR_RED=""
+        COLOR_DIM=""
+        COLOR_RESET=""
+    fi
+}
+
+# Get path to world file based on XDG_CONFIG_HOME logic
+get_world_file() {
+    local config_dir="${XDG_CONFIG_HOME:-${HOME}/.config}"
+    if [[ -d "$config_dir" ]]; then
+        mkdir -p "${config_dir}/apter"
+        echo "${config_dir}/apter/world"
+    else
+        echo "${HOME}/.apter_world"
+    fi
+}
+
+# Record successfully installed packages into world file
+add_to_world_file() {
+    local world_file
+    world_file=$(get_world_file)
+
+    local existing=()
+    if [[ -f "$world_file" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && existing+=("$line")
+        done < "$world_file"
+    fi
+
+    declare -A seen
+    for p in "${existing[@]}"; do
+        [[ -n "$p" ]] && seen["$p"]=1
+    done
+
+    local newly_added=()
+    for pkg in "$@"; do
+        if [[ -z "${seen[$pkg]:-}" ]]; then
+            seen["$pkg"]=1
+            newly_added+=("$pkg")
+        fi
+    done
+
+    if [[ ${#newly_added[@]} -gt 0 ]]; then
+        printf "%s\n" "${!seen[@]}" | sort -u > "$world_file"
+        echo -e "${COLOR_GREEN}Recorded package(s) in world file (${world_file}).${COLOR_RESET}"
+    fi
+}
+
+# Remove uninstalled packages from world file
+remove_from_world_file() {
+    local world_file
+    world_file=$(get_world_file)
+
+    if [[ ! -f "$world_file" ]]; then
+        return 0
+    fi
+
+    declare -A to_remove
+    for p in "$@"; do
+        to_remove["$p"]=1
+    done
+
+    local remaining=()
+    local removed=()
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        if [[ -n "${to_remove[$line]:-}" ]]; then
+            removed+=("$line")
+        else
+            remaining+=("$line")
+        fi
+    done < "$world_file"
+
+    if [[ ${#removed[@]} -gt 0 ]]; then
+        if [[ ${#remaining[@]} -gt 0 ]]; then
+            printf "%s\n" "${remaining[@]}" | sort -u > "$world_file"
+        else
+            rm -f "$world_file"
+        fi
+        echo -e "${COLOR_YELLOW}Removed package(s) from world file (${world_file}): ${removed[*]}${COLOR_RESET}"
+    fi
+}
+
+# Convert shell glob (*, ?, [...]) to extended regex pattern
+glob_to_regex() {
+    local glob="$1"
+    local anchor_end="${2:-true}"
+    local regex=""
+    local i char
+    local in_class=false
+
+    for (( i=0; i<${#glob}; i++ )); do
+        char="${glob:$i:1}"
+        if [[ "$in_class" == true ]]; then
+            if [[ "$char" == "]" ]]; then
+                in_class=false
+                regex="${regex}]"
+            else
+                regex="${regex}${char}"
+            fi
+            continue
+        fi
+
+        case "$char" in
+            "*") regex="${regex}.*" ;;
+            "?") regex="${regex}." ;;
+            "[") in_class=true; regex="${regex}[" ;;
+            ".") regex="${regex}\." ;;
+            "+") regex="${regex}\+" ;;
+            "^") regex="${regex}\^" ;;
+            "$") regex="${regex}\$" ;;
+            "(") regex="${regex}\(" ;;
+            ")") regex="${regex}\)" ;;
+            "{") regex="${regex}\{" ;;
+            "}") regex="${regex}\}" ;;
+            "|") regex="${regex}\|" ;;
+            "\\") regex="${regex}\\" ;;
+            *) regex="${regex}${char}" ;;
+        esac
+    done
+
+    if [[ "$anchor_end" == true ]]; then
+        echo "^${regex}\$"
+    else
+        echo "^${regex}"
+    fi
+}
+
+# Check if string contains shell glob wildcards (*, ?, [...])
+has_glob() {
+    [[ "$1" == *'*'* || "$1" == *'?'* || "$1" == *'['* ]]
+}
+
+# Expand package names / glob patterns against APT package index
+expand_package_args() {
+    local expanded=()
+    for arg in "$@"; do
+        if has_glob "$arg"; then
+            local regex
+            regex=$(glob_to_regex "$arg" true)
+            local matches=()
+            while IFS= read -r pkg; do
+                [[ -n "$pkg" ]] && matches+=("$pkg")
+            done < <(apt-cache pkgnames | grep -E "$regex" | sort -V || true)
+
+            if [[ ${#matches[@]} -eq 0 ]]; then
+                echo "Warning: No packages matched shell glob pattern '$arg'" >&2
+            else
+                expanded+=("${matches[@]}")
+            fi
+        else
+            expanded+=("$arg")
+        fi
+    done
+    printf "%s\n" "${expanded[@]}"
+}
+
+usage() {
+    cat <<EOF
+apter v${VERSION} - Helper / porcelain for apt infrastructure
+
+Usage:
+  apter search [options] <query>    Search for packages (anchored by default, supports globs)
+  apter info <package|glob...>      Show clean description and version status (supports globs)
+  apter install [apt-opts] <pkg...> Install exact packages cleanly and record in world file
+  apter remove [apt-opts] <pkg...>  Remove exact packages cleanly and sync world file
+  apter world                       List packages recorded in your world file with status
+  apter update                      Quietly update apt package index
+  apter upgrade [apt-opts]          List upgradable packages cleanly and perform upgrade
+  apter orphans [options]           List or remove unneeded orphan dependency packages
+  apter who <file|command...>       Find package that installed a given file or command
+  apter what <package|glob...>      List all files installed by package(s) (supports globs)
+  apter history [options]           Display clean timeline of past package operations
+  apter help                        Show this help message
+  apter version                     Show version information
+
+Search options:
+  -a, --all                         Broad/unanchored search (same scope as apt-cache search)
+  -h, --help                        Show help for search command
+
+Examples:
+  apter search clang                Search for 'clang' and versioned variants (e.g. clang-19)
+  apter search 'clang-*'            Search using shell glob pattern matching
+  apter info 'clang-1?'             Display description and version info for clang-14 .. clang-19
+  apter install sl htop             Install exact packages and track them in world file
+  apter remove sl                   Remove exact package and sync world file
+  apter world                       Show contents of your world file
+  apter who /usr/bin/gcc            Find which package installed /usr/bin/gcc
+  apter what adduser                List all files installed by package 'adduser'
+  apter history -n 5                Show last 5 package operations in apt history
+EOF
+}
+
+# Stream filter for install output
+filter_apt_install_output() {
+    while read -r line; do
+        if [[ "$line" =~ ^Inst\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
+            printf "  ${COLOR_CYAN}Installing:${COLOR_RESET} %s (${COLOR_GREEN}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^Conf\ ([^[:space:]]+) ]]; then
+            printf "  ${COLOR_YELLOW}Configuring:${COLOR_RESET} %s\n" "${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ ^(E:|Err:|Error:|N:) ]]; then
+            echo -e "  $line" >&2
+        fi
+    done
+}
+
+# Stream filter for remove output
+filter_apt_remove_output() {
+    while read -r line; do
+        if [[ "$line" =~ ^Remv\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
+            printf "  ${COLOR_YELLOW}Removing:${COLOR_RESET} %s (${COLOR_DIM}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^Purg\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
+            printf "  ${COLOR_RED}Purging:${COLOR_RESET} %s (${COLOR_DIM}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ ^(E:|Err:|Error:|N:) ]]; then
+            echo -e "  $line" >&2
+        fi
+    done
+}
+
+# Search implementation
+cmd_search() {
+    local broad_search=false
+    local queries=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--all)
+                broad_search=true
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: apter search [options] <query...>
+
+Searches the apt package index.
+By default, apter anchors the search term to match only the primary package name
+and its versioned variants (e.g. 'clang', 'clang-19').
+Supports shell glob patterns like 'clang-1?' or 'gcc-*'.
+
+Options:
+  -a, --all    Perform broad, unanchored search matching names and descriptions.
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                queries+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#queries[@]} -eq 0 ]]; then
+        echo "Error: No search query provided." >&2
+        echo "Run 'apter search --help' for usage." >&2
+        return 1
+    fi
+
+    declare -A installed_pkgs
+    while read -r pkg status; do
+        if [[ "$status" == "installed" ]]; then
+            installed_pkgs["$pkg"]=1
+        fi
+    done < <(dpkg-query -W -f='${Package} ${db:Status-Status}\n' 2>/dev/null || true)
+
+    for query in "${queries[@]}"; do
+        local total_matches=0
+
+        if [[ "$broad_search" == true ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local pkg_name
+                pkg_name=$(echo "$line" | cut -d" " -f1)
+                local desc
+                desc=$(echo "$line" | cut -d" " -f3-)
+
+                local status_tag=""
+                if [[ -n "${installed_pkgs[$pkg_name]:-}" ]]; then
+                    status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
+                fi
+
+                printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-12b %s\n" "$pkg_name" "$status_tag" "$desc"
+                total_matches=$((total_matches + 1))
+            done < <(apt-cache search "$query")
+        else
+            local pattern
+            local prefix_search=""
+
+            if has_glob "$query"; then
+                pattern="$(glob_to_regex "$query" false)\s"
+                local raw_prefix
+                raw_prefix=$(echo "$query" | sed -E 's/[*?[].*//')
+                if [[ -n "$raw_prefix" ]]; then
+                    prefix_search=$(printf '%s\n' "$raw_prefix" | sed 's/[.[\*^$()+?{|]/\\&/g')
+                fi
+            else
+                local escaped_query
+                escaped_query=$(printf '%s\n' "$query" | sed 's/[.[\*^$()+?{|]/\\&/g')
+                pattern="^${escaped_query}([.-]?[0-9]+(\.[0-9]+)*)?\s"
+                prefix_search="$escaped_query"
+            fi
+
+            local search_cmd=("apt-cache" "search")
+            if [[ -n "$prefix_search" ]]; then
+                search_cmd+=("^${prefix_search}")
+            fi
+
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local pkg_name
+                pkg_name=$(echo "$line" | cut -d" " -f1)
+                local desc
+                desc=$(echo "$line" | cut -d" " -f3-)
+
+                local status_tag=""
+                if [[ -n "${installed_pkgs[$pkg_name]:-}" ]]; then
+                    status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
+                fi
+
+                printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-12b %s\n" "$pkg_name" "$status_tag" "$desc"
+                total_matches=$((total_matches + 1))
+            done < <("${search_cmd[@]}" | grep -E "$pattern" || true)
+        fi
+
+        if [[ $total_matches -eq 0 ]]; then
+            if [[ "$broad_search" == false ]]; then
+                echo "No anchored or glob matches found for '$query'."
+                echo "Tip: Try 'apter search -a $query' for a broad search across all package descriptions."
+            else
+                echo "No packages found matching '$query'."
+            fi
+        fi
+    done
+}
+
+# Info implementation
+cmd_info() {
+    local raw_pkgs=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: apter info <package|glob...>
+
+Displays the package description and version status (installed vs candidate).
+Supports shell glob patterns (e.g. 'clang-1?', 'gcc-*').
+Filters out technical metadata (MD5 hashes, architecture, dependencies, etc.).
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                raw_pkgs+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#raw_pkgs[@]} -eq 0 ]]; then
+        echo "Error: No package specified." >&2
+        echo "Run 'apter info --help' for usage." >&2
+        return 1
+    fi
+
+    local pkgs=()
+    while IFS= read -r pkg; do
+        [[ -n "$pkg" ]] && pkgs+=("$pkg")
+    done < <(expand_package_args "${raw_pkgs[@]}")
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    for pkg in "${pkgs[@]}"; do
+        local policy_out
+        policy_out=$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null || true)
+        local installed_ver
+        installed_ver=$(echo "$policy_out" | awk '/Installed:/ {print $2}')
+        local candidate_ver
+        candidate_ver=$(echo "$policy_out" | awk '/Candidate:/ {print $2}')
+
+        if [[ -z "$candidate_ver" ]]; then
+            echo "Package '$pkg' not found in apt cache." >&2
+            continue
+        fi
+
+        local desc
+        desc=$(awk '
+        /^Description(-[a-z_]+)?: / {
+            sub(/^Description(-[a-z_]+)?: /, "")
+            print $0
+            in_desc = 1
+            next
+        }
+        in_desc {
+            if (/^[ \t]/) {
+                line = $0
+                sub(/^[ \t](\.)?/, "", line)
+                print line
+            } else {
+                exit
+            }
+        }
+        ' <(apt-cache show "$pkg" 2>/dev/null || true))
+
+        printf "${COLOR_CYAN}%-12s${COLOR_RESET} %b%s%b\n" "Package:" "${COLOR_YELLOW}" "$pkg" "${COLOR_RESET}"
+
+        if [[ -n "$installed_ver" && "$installed_ver" != "(none)" ]]; then
+            printf "${COLOR_CYAN}%-12s${COLOR_RESET} %b%s%b\n" "Installed:" "${COLOR_GREEN}" "$installed_ver" "${COLOR_RESET}"
+        else
+            printf "${COLOR_CYAN}%-12s${COLOR_RESET} %b(none)${COLOR_RESET}\n" "Installed:" "${COLOR_DIM}"
+        fi
+
+        printf "${COLOR_CYAN}%-12s${COLOR_RESET} %s\n" "Candidate:" "$candidate_ver"
+        echo
+        echo -e "${COLOR_YELLOW}Description:${COLOR_RESET}"
+        if [[ -n "$desc" ]]; then
+            while IFS= read -r line; do
+                if [[ -z "$line" ]]; then
+                    echo
+                else
+                    echo "  $line"
+                fi
+            done <<< "$desc"
+        else
+            echo "  (No description available)"
+        fi
+        echo
+    done
+}
+
+# Install implementation
+cmd_install() {
+    local apt_opts=()
+    local pkgs=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: apter install [apt-options] <package...>
+
+Installs specified packages using apt-get. Wildcards are NOT allowed.
+Output is unlocalized (LC_ALL=C) and curbed to show clean package installation info only.
+Successfully installed package names are recorded in the apter world file.
+
+Options:
+  -h, --help    Show this help message
+  (Other options such as -y or --no-install-recommends are passed directly to apt-get)
+EOF
+                return 0
+                ;;
+            -*)
+                apt_opts+=("$1")
+                shift
+                ;;
+            *)
+                pkgs+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        echo "Error: No package specified for installation." >&2
+        echo "Run 'apter install --help' for usage." >&2
+        return 1
+    fi
+
+    for pkg in "${pkgs[@]}"; do
+        if has_glob "$pkg"; then
+            echo "Error: Wildcards are not allowed in 'apter install' ('$pkg')." >&2
+            echo "Please specify exact package names." >&2
+            return 1
+        fi
+    done
+
+    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
+        add_to_world_file "${pkgs[@]}"
+    else
+        local status=$?
+        echo "Installation failed." >&2
+        return $status
+    fi
+}
+
+# Remove implementation
+cmd_remove() {
+    local apt_opts=()
+    local pkgs=()
+    local is_purge=false
+
+    if [[ "${1:-}" == "purge" ]]; then
+        is_purge=true
+        shift
+    fi
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --purge)
+                is_purge=true
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: apter remove [apt-options] <package...>
+       apter purge [apt-options] <package...>
+
+Removes specified packages using apt-get. Wildcards are NOT allowed.
+Output is unlocalized (LC_ALL=C) and curbed to show clean removal info only.
+Successfully uninstalled package names are removed from the apter world file.
+
+Options:
+  --purge       Remove configuration files as well
+  -h, --help    Show this help message
+EOF
+                return 0
+                ;;
+            -*)
+                apt_opts+=("$1")
+                shift
+                ;;
+            *)
+                pkgs+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        echo "Error: No package specified for removal." >&2
+        echo "Run 'apter remove --help' for usage." >&2
+        return 1
+    fi
+
+    for pkg in "${pkgs[@]}"; do
+        if has_glob "$pkg"; then
+            echo "Error: Wildcards are not allowed in 'apter remove' ('$pkg')." >&2
+            echo "Please specify exact package names." >&2
+            return 1
+        fi
+    done
+
+    local action_flag="remove"
+    if [[ "$is_purge" == true ]]; then
+        action_flag="purge"
+    fi
+
+    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
+        remove_from_world_file "${pkgs[@]}"
+    else
+        local status=$?
+        echo "Removal failed." >&2
+        return $status
+    fi
+}
+
+# World implementation
+cmd_world() {
+    local world_file
+    world_file=$(get_world_file)
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: apter world
+
+Lists all packages recorded in your apter world file alongside their current status.
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ! -f "$world_file" ]] || [[ ! -s "$world_file" ]]; then
+        echo "World file ($world_file) is empty."
+        echo "Use 'apter install <package>' to add packages to your world file."
+        return 0
+    fi
+
+    echo -e "${COLOR_CYAN}World packages (${world_file}):${COLOR_RESET}"
+    while IFS= read -r pkg; do
+        [[ -z "$pkg" ]] && continue
+        local policy_out
+        policy_out=$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null || true)
+        local installed_ver
+        installed_ver=$(echo "$policy_out" | awk '/Installed:/ {print $2}')
+        local candidate_ver
+        candidate_ver=$(echo "$policy_out" | awk '/Candidate:/ {print $2}')
+
+        local status_tag=""
+        local ver_info=""
+
+        if [[ -n "$installed_ver" && "$installed_ver" != "(none)" ]]; then
+            if [[ -n "$candidate_ver" && "$candidate_ver" != "(none)" && "$candidate_ver" != "$installed_ver" ]]; then
+                status_tag="${COLOR_YELLOW}[upgradable]${COLOR_RESET}"
+                ver_info="${installed_ver} -> ${candidate_ver}"
+            else
+                status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
+                ver_info="${installed_ver}"
+            fi
+        else
+            status_tag="${COLOR_RED}[missing]${COLOR_RESET}"
+            ver_info="candidate: ${candidate_ver:-(none)}"
+        fi
+
+        printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-16b %s\n" "$pkg" "$status_tag" "(${ver_info})"
+    done < "$world_file"
+}
+
+# Update implementation
+cmd_update() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: apter update"
+                echo "Quietly updates the apt package index."
+                return 0
+                ;;
+            *) shift ;;
+        esac
+    done
+
+    echo -e "${COLOR_CYAN}Updating package index...${COLOR_RESET}"
+    if LC_ALL=C sudo apt-get -q=2 update; then
+        echo -e "${COLOR_GREEN}Package index updated successfully.${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}Failed to update package index.${COLOR_RESET}" >&2
+        return 1
+    fi
+}
+
+# Upgrade implementation
+cmd_upgrade() {
+    local apt_opts=()
+    local auto_yes=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)
+                auto_yes=true
+                apt_opts+=("$1")
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: apter upgrade [apt-options]
+
+Lists all packages with available upgrades and performs system upgrade cleanly.
+EOF
+                return 0
+                ;;
+            -*)
+                apt_opts+=("$1")
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    echo -e "${COLOR_CYAN}Checking for upgradable packages...${COLOR_RESET}"
+    local upgrade_out
+    upgrade_out=$(LC_ALL=C apt-get -s -q=2 upgrade 2>/dev/null || true)
+
+    local upgradable=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Inst\ ([^[:space:]]+)\ \[([^\]]+)\]\ \(([^[:space:]]+) ]]; then
+            upgradable+=("${BASH_REMATCH[1]}\t${BASH_REMATCH[2]}\t${BASH_REMATCH[3]}")
+        fi
+    done <<< "$upgrade_out"
+
+    if [[ ${#upgradable[@]} -eq 0 ]]; then
+        echo -e "${COLOR_GREEN}All system packages are up to date.${COLOR_RESET}"
+        return 0
+    fi
+
+    echo -e "${COLOR_YELLOW}Upgradable package(s) (${#upgradable[@]}):${COLOR_RESET}"
+    for item in "${upgradable[@]}"; do
+        local p
+        p=$(echo "$item" | cut -f1)
+        local cur_v
+        cur_v=$(echo "$item" | cut -f2)
+        local new_v
+        new_v=$(echo "$item" | cut -f3)
+        printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %s -> ${COLOR_GREEN}%s${COLOR_RESET}\n" "$p" "$cur_v" "$new_v"
+    done
+    echo
+
+    if [[ "$auto_yes" == false ]]; then
+        read -r -p "Proceed with upgrading these packages? [Y/n] " response
+        if [[ "$response" =~ ^[Nn] ]]; then
+            echo "Upgrade cancelled."
+            return 0
+        fi
+    fi
+
+    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 upgrade "${apt_opts[@]}" 2>&1 | filter_apt_install_output; then
+        echo -e "${COLOR_GREEN}System upgrade completed successfully.${COLOR_RESET}"
+    else
+        echo -e "${COLOR_RED}System upgrade failed.${COLOR_RESET}" >&2
+        return 1
+    fi
+}
+
+# Orphans implementation
+cmd_orphans() {
+    local clean_mode=false
+    local auto_yes=false
+    local apt_opts=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--clean|clean)
+                clean_mode=true
+                shift
+                ;;
+            -y|--yes)
+                auto_yes=true
+                apt_opts+=("$1")
+                shift
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: apter orphans [options]
+       apter autoremove [options]
+
+Lists or cleans packages that were installed automatically and are no longer needed.
+
+Options:
+  -c, --clean    Remove orphaned packages from system
+  -y, --yes      Automatic yes to prompts
+EOF
+                return 0
+                ;;
+            -*)
+                apt_opts+=("$1")
+                shift
+                ;;
+            *)
+                shift
+                ;;
+        esac
+    done
+
+    local auto_out
+    auto_out=$(LC_ALL=C apt-get -s -q=2 autoremove 2>/dev/null || true)
+
+    local orphans=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^Remv\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
+            orphans+=("${BASH_REMATCH[1]}\t${BASH_REMATCH[2]}")
+        fi
+    done <<< "$auto_out"
+
+    if [[ ${#orphans[@]} -eq 0 ]]; then
+        echo -e "${COLOR_GREEN}No orphaned dependency packages found.${COLOR_RESET}"
+        return 0
+    fi
+
+    echo -e "${COLOR_YELLOW}Orphaned package(s) (${#orphans[@]}):${COLOR_RESET}"
+    for item in "${orphans[@]}"; do
+        local p
+        p=$(echo "$item" | cut -f1)
+        local v
+        v=$(echo "$item" | cut -f2)
+        printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} (${COLOR_DIM}%s${COLOR_RESET})\n" "$p" "$v"
+    done
+    echo
+
+    if [[ "$clean_mode" == true ]]; then
+        if [[ "$auto_yes" == false ]]; then
+            read -r -p "Remove these orphaned packages? [Y/n] " response
+            if [[ "$response" =~ ^[Nn] ]]; then
+                echo "Operation cancelled."
+                return 0
+            fi
+        fi
+
+        if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 autoremove "${apt_opts[@]}" 2>&1 | filter_apt_remove_output; then
+            echo -e "${COLOR_GREEN}Orphaned packages removed successfully.${COLOR_RESET}"
+        else
+            echo -e "${COLOR_RED}Failed to remove orphaned packages.${COLOR_RESET}" >&2
+            return 1
+        fi
+    else
+        echo "Tip: Run 'apter orphans --clean' or 'apter autoremove' to remove them."
+    fi
+}
+
+# Who implementation (file ownership)
+cmd_who() {
+    local files=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: apter who <file|command...>
+
+Shows which package installed the specified file or command.
+
+Examples:
+  apter who /usr/bin/gcc
+  apter who bash
+  apter who /etc/apt/sources.list
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                files+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#files[@]} -eq 0 ]]; then
+        echo "Error: No file or command specified." >&2
+        echo "Run 'apter who --help' for usage." >&2
+        return 1
+    fi
+
+    for target in "${files[@]}"; do
+        local path_to_test="$target"
+
+        if [[ ! -e "$path_to_test" ]]; then
+            local found_in_path
+            found_in_path=$(command -v "$target" || true)
+            if [[ -n "$found_in_path" ]]; then
+                path_to_test="$found_in_path"
+            fi
+        fi
+
+        local out=""
+        out=$(LC_ALL=C dpkg-query -S "$path_to_test" 2>/dev/null || true)
+
+        if [[ -z "$out" && -e "$path_to_test" ]]; then
+            local real_p
+            real_p=$(realpath "$path_to_test" 2>/dev/null || true)
+            if [[ -n "$real_p" && "$real_p" != "$path_to_test" ]]; then
+                out=$(LC_ALL=C dpkg-query -S "$real_p" 2>/dev/null || true)
+            fi
+        fi
+
+        if [[ -n "$out" ]]; then
+            while IFS= read -r line; do
+                [[ -z "$line" ]] && continue
+                local pkg_part="${line%%:*}"
+                local file_part="${line#*: }"
+                printf "  ${COLOR_CYAN}%s${COLOR_RESET} is owned by package ${COLOR_GREEN}%s${COLOR_RESET}\n" "$file_part" "$pkg_part"
+            done <<< "$out"
+        else
+            echo "  '$target' is not owned by any installed package."
+        fi
+    done
+}
+
+# What implementation (package files listing)
+cmd_what() {
+    local raw_pkgs=()
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                cat <<EOF
+Usage: apter what <package|glob...>
+
+Lists all files installed by the specified package(s).
+Supports shell glob patterns (e.g. 'clang-1?', 'gcc-*').
+
+Examples:
+  apter what adduser
+  apter what 'gcc-*'
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                raw_pkgs+=("$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ ${#raw_pkgs[@]} -eq 0 ]]; then
+        echo "Error: No package specified." >&2
+        echo "Run 'apter what --help' for usage." >&2
+        return 1
+    fi
+
+    local pkgs=()
+    for arg in "${raw_pkgs[@]}"; do
+        if has_glob "$arg"; then
+            local regex
+            regex=$(glob_to_regex "$arg" true)
+            local matches=()
+            while IFS= read -r p; do
+                [[ -n "$p" ]] && matches+=("$p")
+            done < <(dpkg-query -W -f='${Package} ${db:Status-Status}\n' 2>/dev/null | awk '$2=="installed"{print $1}' | grep -E "$regex" | sort -V || true)
+
+            if [[ ${#matches[@]} -eq 0 ]]; then
+                echo "Warning: No installed packages matched shell glob pattern '$arg'" >&2
+            else
+                pkgs+=("${matches[@]}")
+            fi
+        else
+            pkgs+=("$arg")
+        fi
+    done
+
+    if [[ ${#pkgs[@]} -eq 0 ]]; then
+        return 1
+    fi
+
+    for pkg in "${pkgs[@]}"; do
+        local files
+        files=$(dpkg-query -L "$pkg" 2>/dev/null || true)
+
+        if [[ -z "$files" ]]; then
+            echo "Package '$pkg' is not installed or has no installed files." >&2
+            continue
+        fi
+
+        echo -e "${COLOR_CYAN}Files installed by package:${COLOR_RESET} ${COLOR_YELLOW}$pkg${COLOR_RESET}"
+        while IFS= read -r file; do
+            [[ -z "$file" ]] && continue
+            echo "  $file"
+        done <<< "$files"
+        echo
+    done
+}
+
+# History implementation
+cmd_history() {
+    local limit=10
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--number)
+                limit="$2"
+                shift 2
+                ;;
+            -h|--help)
+                cat <<EOF
+Usage: apter history [options]
+
+Displays a clean chronological timeline of past package operations.
+
+Options:
+  -n, --number <N>  Number of recent history events to show (default: 10)
+  -h, --help        Show this help message
+EOF
+                return 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                return 1
+                ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ ]]; then
+                    limit="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    local log_file="/var/log/apt/history.log"
+    if [[ ! -f "$log_file" ]]; then
+        echo "No history log found at $log_file" >&2
+        return 1
+    fi
+
+    echo -e "${COLOR_CYAN}Recent APT History (last ${limit} entries):${COLOR_RESET}"
+    awk -v limit="$limit" '
+    BEGIN { RS = ""; FS = "\n" }
+    {
+        date = ""; cmd = ""; user = ""; inst = ""; upg = ""; rem = ""; purg = ""
+        for (i = 1; i <= NF; i++) {
+            line = $i
+            if (line ~ /^Start-Date:/) { sub(/^Start-Date:[ \t]*/, "", line); date = line }
+            else if (line ~ /^Commandline:/) { sub(/^Commandline:[ \t]*/, "", line); cmd = line }
+            else if (line ~ /^Requested-By:/) { sub(/^Requested-By:[ \t]*/, "", line); user = line }
+            else if (line ~ /^Install:/) { sub(/^Install:[ \t]*/, "", line); inst = line }
+            else if (line ~ /^Upgrade:/) { sub(/^Upgrade:[ \t]*/, "", line); upg = line }
+            else if (line ~ /^Remove:/) { sub(/^Remove:[ \t]*/, "", line); rem = line }
+            else if (line ~ /^Purge:/) { sub(/^Purge:/, "", line); purg = line }
+        }
+        if (date != "") {
+            entry = "\033[1;36m[" date "]\033[0m " (user != "" ? "\033[2m(" user ")\033[0m" : "") "\n"
+            if (cmd != "") entry = entry "  \033[1mCmd:\033[0m  " cmd "\n"
+            if (inst != "") entry = entry "  \033[1;32mInst:\033[0m " inst "\n"
+            if (upg != "") entry = entry "  \033[1;33mUpg:\033[0m  " upg "\n"
+            if (rem != "") entry = entry "  \033[1;31mRem:\033[0m  " rem "\n"
+            if (purg != "") entry = entry "  \033[1;31mPurg:\033[0m " purg "\n"
+            entries[count++] = entry
+        }
+    }
+    END {
+        start = (count - limit < 0) ? 0 : count - limit
+        for (j = start; j < count; j++) {
+            print entries[j]
+        }
+    }
+    ' "$log_file"
+}
+
+main() {
+    setup_colors
+
+    if [[ $# -eq 0 ]]; then
+        usage
+        exit 0
+    fi
+
+    case "$1" in
+        search|s)
+            shift
+            cmd_search "$@"
+            ;;
+        info|i|show)
+            shift
+            cmd_info "$@"
+            ;;
+        install|in|add)
+            shift
+            cmd_install "$@"
+            ;;
+        remove|rm|uninstall|purge)
+            cmd_remove "$@"
+            ;;
+        world|wlist|list-world)
+            shift
+            cmd_world "$@"
+            ;;
+        update|up)
+            shift
+            cmd_update "$@"
+            ;;
+        upgrade|ug)
+            shift
+            cmd_upgrade "$@"
+            ;;
+        orphans|autoremove)
+            local subcmd="$1"
+            shift
+            if [[ "$subcmd" == "autoremove" ]]; then
+                cmd_orphans --clean "$@"
+            else
+                cmd_orphans "$@"
+            fi
+            ;;
+        who|owner)
+            shift
+            cmd_who "$@"
+            ;;
+        what|files|contents)
+            shift
+            cmd_what "$@"
+            ;;
+        history|hist|log)
+            shift
+            cmd_history "$@"
+            ;;
+        version|-v|--version)
+            echo "apter version ${VERSION}"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            echo "Unknown command: $1" >&2
+            echo "Run 'apter help' for available commands." >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
