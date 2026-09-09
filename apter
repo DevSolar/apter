@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # Colors (disabled if output is not a terminal or NO_COLOR is set)
 setup_colors() {
@@ -108,7 +108,7 @@ Usage:
   apter info <package|glob...>      Show clean description and version status (supports globs)
   apter install [apt-opts] <pkg...> Install exact packages cleanly
   apter remove [apt-opts] <pkg...>  Remove exact packages cleanly
-  apter world                       List all manually installed packages (via apt-mark)
+  apter world                       List all packages tracked in world log file
   apter update                      Quietly update apt package index
   apter upgrade [apt-opts]          List upgradable packages cleanly and perform upgrade
   apter orphans [options]           List or remove unneeded orphan dependency packages
@@ -132,7 +132,7 @@ Examples:
   apter info 'clang-1?'             Display description and version info for clang-14 .. clang-19
   apter install sl htop             Install exact packages cleanly
   apter remove sl                   Remove exact package cleanly
-  apter world                       Show all manually installed packages on the system
+  apter world                       Show tracked packages from world log file
   apter who /usr/bin/gcc            Find which package installed /usr/bin/gcc
   apter what adduser                List all files installed by package 'adduser'
   apter history -n 5                Show last 5 package operations in apt history
@@ -384,6 +384,86 @@ EOF
     done
 }
 
+# Get the world log file path
+get_world_file() {
+    local state_dir="${XDG_STATE_HOME:-${HOME}/.local/state}"
+    if [[ -f "${state_dir}/apter_world.log" ]]; then
+        echo "${state_dir}/apter_world.log"
+    elif [[ -f "${HOME}/.apter_world.log" ]]; then
+        echo "${HOME}/.apter_world.log"
+    elif [[ -d "$state_dir" ]]; then
+        echo "${state_dir}/apter_world.log"
+    else
+        echo "${HOME}/.apter_world.log"
+    fi
+}
+
+# Add explicit packages to world log file
+world_add_packages() {
+    local world_file
+    world_file=$(get_world_file)
+
+    local target_dir
+    target_dir="$(dirname "$world_file")"
+    if [[ ! -d "$target_dir" ]]; then
+        mkdir -p "$target_dir"
+    fi
+    touch "$world_file"
+
+    local existing=()
+    if [[ -s "$world_file" ]]; then
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] && existing+=("$line")
+        done < "$world_file"
+    fi
+
+    local updated=()
+    declare -A seen
+    for pkg in "${existing[@]}"; do
+        if [[ -z "${seen[$pkg]:-}" ]]; then
+            seen["$pkg"]=1
+            updated+=("$pkg")
+        fi
+    done
+    for pkg in "$@"; do
+        if [[ -z "${seen[$pkg]:-}" ]]; then
+            seen["$pkg"]=1
+            updated+=("$pkg")
+        fi
+    done
+
+    if [[ ${#updated[@]} -gt 0 ]]; then
+        printf "%s\n" "${updated[@]}" | sort -u > "$world_file"
+    else
+        > "$world_file"
+    fi
+}
+
+# Remove explicit packages from world log file
+world_remove_packages() {
+    local world_file
+    world_file=$(get_world_file)
+    [[ ! -f "$world_file" ]] && return 0
+
+    declare -A remove_map
+    for pkg in "$@"; do
+        remove_map["$pkg"]=1
+    done
+
+    local remaining=()
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ -n "$line" && -z "${remove_map[$line]:-}" ]]; then
+            remaining+=("$line")
+        fi
+    done < "$world_file"
+
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        printf "%s\n" "${remaining[@]}" | sort -u > "$world_file"
+    else
+        > "$world_file"
+    fi
+}
+
 # Install implementation
 cmd_install() {
     local apt_opts=()
@@ -434,6 +514,8 @@ EOF
         echo "Installation failed." >&2
         return $status
     fi
+
+    world_add_packages "${pkgs[@]}"
 }
 
 # Remove implementation
@@ -441,11 +523,6 @@ cmd_remove() {
     local apt_opts=()
     local pkgs=()
     local is_purge=false
-
-    if [[ "${1:-}" == "purge" ]]; then
-        is_purge=true
-        shift
-    fi
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -502,9 +579,11 @@ EOF
         echo "Removal failed." >&2
         return $status
     fi
+
+    world_remove_packages "${pkgs[@]}"
 }
 
-# World implementation (dynamically queries apt-mark showmanual)
+# World implementation (displays tracked packages from world log file)
 cmd_world() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -512,7 +591,7 @@ cmd_world() {
                 cat <<EOF
 Usage: apter world
 
-Lists all manually installed packages on the system (via apt-mark showmanual) alongside their status.
+Lists all packages tracked in the world log file.
 EOF
                 return 0
                 ;;
@@ -526,43 +605,12 @@ EOF
         esac
     done
 
-    local pkgs=()
-    while IFS= read -r pkg; do
-        [[ -n "$pkg" ]] && pkgs+=("$pkg")
-    done < <(apt-mark showmanual 2>/dev/null | sort -u || true)
+    local world_file
+    world_file=$(get_world_file)
 
-    if [[ ${#pkgs[@]} -eq 0 ]]; then
-        echo "No manually installed packages found."
-        return 0
+    if [[ -f "$world_file" ]]; then
+        cat "$world_file" | column
     fi
-
-    echo -e "${COLOR_CYAN}World packages (${#pkgs[@]} manually installed via apt-mark):${COLOR_RESET}"
-    for pkg in "${pkgs[@]}"; do
-        local policy_out
-        policy_out=$(LC_ALL=C apt-cache policy "$pkg" 2>/dev/null || true)
-        local installed_ver
-        installed_ver=$(echo "$policy_out" | awk '/Installed:/ {print $2}')
-        local candidate_ver
-        candidate_ver=$(echo "$policy_out" | awk '/Candidate:/ {print $2}')
-
-        local status_tag=""
-        local ver_info=""
-
-        if [[ -n "$installed_ver" && "$installed_ver" != "(none)" ]]; then
-            if [[ -n "$candidate_ver" && "$candidate_ver" != "(none)" && "$candidate_ver" != "$installed_ver" ]]; then
-                status_tag="${COLOR_YELLOW}[upgradable]${COLOR_RESET}"
-                ver_info="${installed_ver} -> ${candidate_ver}"
-            else
-                status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
-                ver_info="${installed_ver}"
-            fi
-        else
-            status_tag="${COLOR_RED}[missing]${COLOR_RESET}"
-            ver_info="candidate: ${candidate_ver:-(none)}"
-        fi
-
-        printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-16b %s\n" "$pkg" "$status_tag" "(${ver_info})"
-    done
 }
 
 # Update implementation
@@ -1027,7 +1075,13 @@ main() {
             cmd_install "$@"
             ;;
         remove|rm|uninstall|purge)
-            cmd_remove "$@"
+            local subcmd="$1"
+            shift
+            if [[ "$subcmd" == "purge" ]]; then
+                cmd_remove --purge "$@"
+            else
+                cmd_remove "$@"
+            fi
             ;;
         world|wlist|list-world)
             shift

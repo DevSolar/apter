@@ -11,7 +11,7 @@ It focuses on providing a clean, fast, UNIX-style CLI experience without the clu
 - **Noise-Free Anchored Search**: `apter search` anchors search queries to primary package names and versioned variants (e.g. `clang` returns `clang` and `clang-19`, filtering out `clangd` or `libclang-dev`). Supports unanchored search (`-a`) when desired.
 - **Shell Glob Expansion**: Native shell glob pattern matching (`*`, `?`, `[...]`) across matching commands (`info`, `search`, `what`).
 - **Clean Package Info**: `apter info` strips technical hashes, maintainers, and build metadata, showing only plain-text descriptions alongside `Installed` vs `Candidate` versions.
-- **World File Package Tracking**: `apter install` and `apter remove` require exact package names (no wildcards) and track your explicitly installed software in `${XDG_CONFIG_HOME:-~/.config}/apter/world` (or `~/.apter_world`).
+- **World File Package Tracking**: `apter install` and `apter remove` require exact package names (no wildcards) and track your explicitly installed software in `${XDG_STATE_HOME:-~/.local/state}/apter_world.log` (or `~/.apter_world.log`).
 - **Curbed, Deterministic Output**: Installation and removal operations force `LC_ALL=C -q=2` and stream-filter output to highlight installation/configuration actions without walls of technical status text.
 - **File Ownership & Contents**: Instantly find which package installed a command or file (`apter who`), or list files installed by a package (`apter what`).
 - **Clean History Timeline**: Parses `/var/log/apt/history.log` into an easy-to-read chronological timeline.
@@ -63,9 +63,9 @@ apter purge sl                   # Uninstall package and purge configuration fil
 ```
 
 ### `apter world`
-Lists all manually installed packages on the system (dynamically queried from `apt-mark showmanual`) alongside their current status (`[installed]`, `[upgradable]`, or `[missing]`).
+Lists all packages tracked in the world log file (`apter_world.log`), formatted into columns.
 ```bash
-apter world                      # Show all manually installed packages on the system
+apter world                      # Show tracked packages in world log
 ```
 
 ### `apter update`
