@@ -132,12 +132,16 @@ EOF
 
 # Stream filter for install output
 filter_apt_install_output() {
+    local inst_re='^(Inst|Unpacking)[[:space:]]+([^[:space:]:]+)(:[^[:space:]]+)?[[:space:]]+\(([^)]+)\)'
+    local conf_re='^(Conf|Setting[[:space:]]+up)[[:space:]]+([^[:space:]:]+)'
+    local err_re='^(E:|Err:|Error:|N:|dpkg:)'
+
     while read -r line; do
-        if [[ "$line" =~ ^Inst\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
-            printf "  ${COLOR_CYAN}Installing:${COLOR_RESET} %s (${COLOR_GREEN}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-        elif [[ "$line" =~ ^Conf\ ([^[:space:]]+) ]]; then
-            printf "  ${COLOR_YELLOW}Configuring:${COLOR_RESET} %s\n" "${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ ^(E:|Err:|Error:|N:) ]]; then
+        if [[ "$line" =~ $inst_re ]]; then
+            printf "  ${COLOR_CYAN}Installing:${COLOR_RESET} %s (${COLOR_GREEN}%s${COLOR_RESET})\n" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"
+        elif [[ "$line" =~ $conf_re ]]; then
+            printf "  ${COLOR_YELLOW}Configuring:${COLOR_RESET} %s\n" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ $err_re ]]; then
             echo -e "  $line" >&2
         fi
     done
@@ -145,12 +149,16 @@ filter_apt_install_output() {
 
 # Stream filter for remove output
 filter_apt_remove_output() {
+    local remv_re='^(Remv|Removing)[[:space:]]+([^[:space:]:]+)(:[^[:space:]]+)?[[:space:]]+\(([^)]+)\)'
+    local purg_re='^(Purg|Purging[[:space:]]+configuration[[:space:]]+files[[:space:]]+for)[[:space:]]+([^[:space:]:]+)'
+    local err_re='^(E:|Err:|Error:|N:|dpkg:)'
+
     while read -r line; do
-        if [[ "$line" =~ ^Remv\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
-            printf "  ${COLOR_YELLOW}Removing:${COLOR_RESET} %s (${COLOR_DIM}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-        elif [[ "$line" =~ ^Purg\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
-            printf "  ${COLOR_RED}Purging:${COLOR_RESET} %s (${COLOR_DIM}%s${COLOR_RESET})\n" "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-        elif [[ "$line" =~ ^(E:|Err:|Error:|N:) ]]; then
+        if [[ "$line" =~ $remv_re ]]; then
+            printf "  ${COLOR_YELLOW}Removing:${COLOR_RESET} %s (${COLOR_DIM}%s${COLOR_RESET})\n" "${BASH_REMATCH[2]}" "${BASH_REMATCH[4]}"
+        elif [[ "$line" =~ $purg_re ]]; then
+            printf "  ${COLOR_RED}Purging:${COLOR_RESET} %s\n" "${BASH_REMATCH[2]}"
+        elif [[ "$line" =~ $err_re ]]; then
             echo -e "  $line" >&2
         fi
     done
@@ -458,7 +466,7 @@ EOF
         fi
     done
 
-    if ! LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
+    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
         local status=$?
         echo "Installation failed." >&2
         return $status
@@ -532,7 +540,7 @@ EOF
         action_flag="purge"
     fi
 
-    if ! LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
+    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
         local status=$?
         echo "Removal failed." >&2
         return $status
@@ -585,7 +593,7 @@ cmd_update() {
     done
 
     echo -e "${COLOR_CYAN}Updating package index...${COLOR_RESET}"
-    if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 update; then
+    if LC_ALL=C sudo apt-get -q=2 update; then
         echo -e "${COLOR_GREEN}Package index updated successfully.${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}Failed to update package index.${COLOR_RESET}" >&2
@@ -668,7 +676,7 @@ EOF
         fi
     fi
 
-    if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 upgrade "${apt_opts[@]}" 2>&1 | filter_apt_install_output; then
+    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 upgrade "${apt_opts[@]}" 2>&1 | filter_apt_install_output; then
         echo -e "${COLOR_GREEN}System upgrade completed successfully.${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}System upgrade failed.${COLOR_RESET}" >&2
@@ -759,7 +767,7 @@ EOF
             fi
         fi
 
-        if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 autoremove "${apt_opts[@]}" 2>&1 | filter_apt_remove_output; then
+        if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 autoremove "${apt_opts[@]}" 2>&1 | filter_apt_remove_output; then
             echo -e "${COLOR_GREEN}Orphaned packages removed successfully.${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}Failed to remove orphaned packages.${COLOR_RESET}" >&2

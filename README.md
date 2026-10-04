@@ -12,7 +12,7 @@ It focuses on providing a clean, fast, UNIX-style CLI experience without the clu
 - **Shell Glob Expansion**: Native shell glob pattern matching (`*`, `?`, `[...]`) across matching commands (`info`, `search`, `what`).
 - **Clean Package Info**: `apter info` strips technical hashes, maintainers, and build metadata, showing only plain-text descriptions alongside `Installed` vs `Candidate` versions.
 - **World File Package Tracking**: `apter install` and `apter remove` require exact package names (no wildcards) and track your explicitly installed software in `${XDG_STATE_HOME:-~/.local/state}/apter_world.log` (or `~/.apter_world.log`).
-- **Curbed, Deterministic Output**: Package installation, removal, update, and upgrade operations force `LC_ALL=C -o Dpkg::Progress-Fancy=1` with stream-filtered output to show clean actions alongside a terminal progress bar.
+- **Curbed, Deterministic Output**: Package installation and removal operations force `LC_ALL=C -q=2` and stream-filter output to highlight installation/configuration actions cleanly without walls of technical status text.
 - **All-Repository File Ownership**: Instantly find which package provides a command or file across all repository packages (`apter who`).
 - **Clean History Timeline**: Parses `/var/log/apt/history.log` into an easy-to-read chronological timeline.
 
