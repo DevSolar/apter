@@ -411,6 +411,15 @@ cmd_install() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -t|--target-release|--default-release|-o|--option|-c|--config-file|-a|--architecture)
+                if [[ $# -gt 1 ]]; then
+                    apt_opts+=("$1" "$2")
+                    shift 2
+                else
+                    apt_opts+=("$1")
+                    shift
+                fi
+                ;;
             -h|--help)
                 cat <<EOF
 Usage: apter install [apt-options] <package...>
@@ -420,7 +429,7 @@ Output is unlocalized (LC_ALL=C) and curbed to show clean package installation i
 
 Options:
   -h, --help    Show this help message
-  (Other options such as -y or --no-install-recommends are passed directly to apt-get)
+  (Other options such as -t <release>, -y, or --no-install-recommends are passed directly to apt-get)
 EOF
                 return 0
                 ;;
@@ -466,6 +475,15 @@ cmd_remove() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -t|--target-release|--default-release|-o|--option|-c|--config-file|-a|--architecture)
+                if [[ $# -gt 1 ]]; then
+                    apt_opts+=("$1" "$2")
+                    shift 2
+                else
+                    apt_opts+=("$1")
+                    shift
+                fi
+                ;;
             --purge)
                 is_purge=true
                 shift
@@ -582,6 +600,15 @@ cmd_upgrade() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -t|--target-release|--default-release|-o|--option|-c|--config-file|-a|--architecture)
+                if [[ $# -gt 1 ]]; then
+                    apt_opts+=("$1" "$2")
+                    shift 2
+                else
+                    apt_opts+=("$1")
+                    shift
+                fi
+                ;;
             -y|--yes)
                 auto_yes=true
                 apt_opts+=("$1")
@@ -657,6 +684,15 @@ cmd_orphans() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            -t|--target-release|--default-release|-o|--option|-c|--config-file|-a|--architecture)
+                if [[ $# -gt 1 ]]; then
+                    apt_opts+=("$1" "$2")
+                    shift 2
+                else
+                    apt_opts+=("$1")
+                    shift
+                fi
+                ;;
             -c|--clean|clean)
                 clean_mode=true
                 shift
