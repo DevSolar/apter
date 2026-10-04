@@ -104,7 +104,7 @@ usage() {
 apter v${VERSION} - Helper / porcelain for apt infrastructure
 
 Usage:
-  apter search [options] <query>    Search for packages (anchored by default, supports globs)
+  apter search <query...>           Search all repository packages (names and descriptions)
   apter info <package|glob...>      Show clean description and version status (supports globs)
   apter install [apt-opts] <pkg...> Install exact packages cleanly
   apter remove [apt-opts] <pkg...>  Remove exact packages cleanly
@@ -112,28 +112,19 @@ Usage:
   apter update                      Quietly update apt package index
   apter upgrade [apt-opts]          List upgradable packages cleanly and perform upgrade
   apter orphans [options]           List or remove unneeded orphan dependency packages
-  apter who [options] <file|cmd...> Find package that installed a given file or command
+  apter who <file|cmd...>           Find package that provides a given file or command
   apter what <package|glob...>      List all files installed by package(s) (supports globs)
   apter history [options]           Display clean timeline of past package operations
   apter help                        Show this help message
   apter version                     Show version information
 
-Search options:
-  -a, --all                         Broad/unanchored search (same scope as apt-cache search)
-  -h, --help                        Show help for search command
-
-Who options:
-  -a, --all                         Search all repository packages (including uninstalled; requires apt-file)
-  -h, --help                        Show help for who command
-
 Examples:
-  apter search clang                Search for 'clang' and versioned variants (e.g. clang-19)
-  apter search 'clang-*'            Search using shell glob pattern matching
+  apter search clang                Search for packages matching 'clang'
   apter info 'clang-1?'             Display description and version info for clang-14 .. clang-19
   apter install sl htop             Install exact packages cleanly
   apter remove sl                   Remove exact package cleanly
   apter world                       Show tracked packages from world log file
-  apter who /usr/bin/gcc            Find which package installed /usr/bin/gcc
+  apter who /usr/bin/gcc            Find which package provides /usr/bin/gcc
   apter what adduser                List all files installed by package 'adduser'
   apter history -n 5                Show last 5 package operations in apt history
 EOF
@@ -167,26 +158,20 @@ filter_apt_remove_output() {
 
 # Search implementation
 cmd_search() {
-    local broad_search=false
     local queries=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -a|--all)
-                broad_search=true
+                # Accepted for backward compatibility
                 shift
                 ;;
             -h|--help)
                 cat <<EOF
-Usage: apter search [options] <query...>
+Usage: apter search <query...>
 
-Searches the apt package index.
-By default, apter anchors the search term to match only the primary package name
-and its versioned variants (e.g. 'clang', 'clang-19').
-Supports shell glob patterns like 'clang-1?' or 'gcc-*'.
-
-Options:
-  -a, --all    Perform broad, unanchored search matching names and descriptions.
+Searches the apt package index across package names and descriptions.
+Highlights installed packages in green.
 EOF
                 return 0
                 ;;
@@ -217,69 +202,24 @@ EOF
     for query in "${queries[@]}"; do
         local total_matches=0
 
-        if [[ "$broad_search" == true ]]; then
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                local pkg_name
-                pkg_name=$(echo "$line" | cut -d" " -f1)
-                local desc
-                desc=$(echo "$line" | cut -d" " -f3-)
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local pkg_name
+            pkg_name=$(echo "$line" | cut -d" " -f1)
+            local desc
+            desc=$(echo "$line" | cut -d" " -f3-)
 
-                local status_tag=""
-                if [[ -n "${installed_pkgs[$pkg_name]:-}" ]]; then
-                    status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
-                fi
-
-                printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-12b %s\n" "$pkg_name" "$status_tag" "$desc"
-                total_matches=$((total_matches + 1))
-            done < <(apt-cache search "$query")
-        else
-            local pattern
-            local prefix_search=""
-
-            if has_glob "$query"; then
-                pattern="$(glob_to_regex "$query" false)\s"
-                local raw_prefix
-                raw_prefix=$(echo "$query" | sed -E 's/[*?[].*//')
-                if [[ -n "$raw_prefix" ]]; then
-                    prefix_search=$(printf '%s\n' "$raw_prefix" | sed 's/[.[\*^$()+?{|]/\\&/g')
-                fi
-            else
-                local escaped_query
-                escaped_query=$(printf '%s\n' "$query" | sed 's/[.[\*^$()+?{|]/\\&/g')
-                pattern="^${escaped_query}([.-]?[0-9]+(\.[0-9]+)*)?\s"
-                prefix_search="$escaped_query"
+            local status_tag=""
+            if [[ -n "${installed_pkgs[$pkg_name]:-}" ]]; then
+                status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
             fi
 
-            local search_cmd=("apt-cache" "search")
-            if [[ -n "$prefix_search" ]]; then
-                search_cmd+=("^${prefix_search}")
-            fi
-
-            while IFS= read -r line; do
-                [[ -z "$line" ]] && continue
-                local pkg_name
-                pkg_name=$(echo "$line" | cut -d" " -f1)
-                local desc
-                desc=$(echo "$line" | cut -d" " -f3-)
-
-                local status_tag=""
-                if [[ -n "${installed_pkgs[$pkg_name]:-}" ]]; then
-                    status_tag="${COLOR_GREEN}[installed]${COLOR_RESET}"
-                fi
-
-                printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-12b %s\n" "$pkg_name" "$status_tag" "$desc"
-                total_matches=$((total_matches + 1))
-            done < <("${search_cmd[@]}" | grep -E "$pattern" || true)
-        fi
+            printf "  ${COLOR_CYAN}%-26s${COLOR_RESET} %-12b %s\n" "$pkg_name" "$status_tag" "$desc"
+            total_matches=$((total_matches + 1))
+        done < <(apt-cache search "$query")
 
         if [[ $total_matches -eq 0 ]]; then
-            if [[ "$broad_search" == false ]]; then
-                echo "No anchored or glob matches found for '$query'."
-                echo "Tip: Try 'apter search -a $query' for a broad search across all package descriptions."
-            else
-                echo "No packages found matching '$query'."
-            fi
+            echo "No packages found matching '$query'."
         fi
     done
 }
@@ -509,7 +449,7 @@ EOF
         fi
     done
 
-    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
+    if ! LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
         local status=$?
         echo "Installation failed." >&2
         return $status
@@ -574,7 +514,7 @@ EOF
         action_flag="purge"
     fi
 
-    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
+    if ! LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
         local status=$?
         echo "Removal failed." >&2
         return $status
@@ -627,7 +567,7 @@ cmd_update() {
     done
 
     echo -e "${COLOR_CYAN}Updating package index...${COLOR_RESET}"
-    if LC_ALL=C sudo apt-get -q=2 update; then
+    if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 update; then
         echo -e "${COLOR_GREEN}Package index updated successfully.${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}Failed to update package index.${COLOR_RESET}" >&2
@@ -701,7 +641,7 @@ EOF
         fi
     fi
 
-    if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 upgrade "${apt_opts[@]}" 2>&1 | filter_apt_install_output; then
+    if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 upgrade "${apt_opts[@]}" 2>&1 | filter_apt_install_output; then
         echo -e "${COLOR_GREEN}System upgrade completed successfully.${COLOR_RESET}"
     else
         echo -e "${COLOR_RED}System upgrade failed.${COLOR_RESET}" >&2
@@ -783,7 +723,7 @@ EOF
             fi
         fi
 
-        if LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 autoremove "${apt_opts[@]}" 2>&1 | filter_apt_remove_output; then
+        if LC_ALL=C sudo apt-get -o Dpkg::Progress-Fancy=1 autoremove "${apt_opts[@]}" 2>&1 | filter_apt_remove_output; then
             echo -e "${COLOR_GREEN}Orphaned packages removed successfully.${COLOR_RESET}"
         else
             echo -e "${COLOR_RED}Failed to remove orphaned packages.${COLOR_RESET}" >&2
@@ -796,28 +736,23 @@ EOF
 
 # Who implementation (file ownership)
 cmd_who() {
-    local search_all=false
     local files=()
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -a|--all)
-                search_all=true
+                # Accepted for backward compatibility
                 shift
                 ;;
             -h|--help)
                 cat <<EOF
-Usage: apter who [options] <file|command...>
+Usage: apter who <file|command...>
 
-Shows which package installed (or provides) the specified file or command.
-
-Options:
-  -a, --all    Search among all repository packages (including uninstalled; requires apt-file)
-  -h, --help   Show this help message
+Shows which package provides the specified file or command across all repository packages.
+Uses 'apt-file' if available to search all repository packages (including uninstalled).
 
 Examples:
   apter who /usr/bin/gcc
-  apter who -a /usr/bin/ninja
   apter who bash
 EOF
                 return 0
@@ -839,12 +774,9 @@ EOF
         return 1
     fi
 
-    if [[ "$search_all" == true ]]; then
-        if ! command -v apt-file >/dev/null 2>&1; then
-            echo "Error: 'apt-file' is required to search uninstalled packages." >&2
-            echo "Tip: Install it using 'apter install apt-file' and update index ('sudo apt-file update' or 'sudo apt update')." >&2
-            return 1
-        fi
+    local has_apt_file=false
+    if command -v apt-file >/dev/null 2>&1; then
+        has_apt_file=true
     fi
 
     for target in "${files[@]}"; do
@@ -859,7 +791,7 @@ EOF
         fi
 
         local out=""
-        if [[ "$search_all" == true ]]; then
+        if [[ "$has_apt_file" == true ]]; then
             if [[ "$path_to_test" == /* ]]; then
                 out=$(LC_ALL=C apt-file search -F "$path_to_test" 2>/dev/null || true)
             else
@@ -890,11 +822,15 @@ EOF
                 local file_part="${line#*: }"
                 printf "  ${COLOR_CYAN}%s${COLOR_RESET} is owned by package ${COLOR_GREEN}%s${COLOR_RESET}\n" "$file_part" "$pkg_part"
             done <<< "$out"
+            if [[ "$has_apt_file" == false ]]; then
+                echo "Tip: Install 'apt-file' ('apter install apt-file') to search uninstalled repository packages too." >&2
+            fi
         else
-            if [[ "$search_all" == true ]]; then
+            if [[ "$has_apt_file" == true ]]; then
                 echo "  '$target' was not found in any repository package."
             else
                 echo "  '$target' is not owned by any installed package."
+                echo "Tip: Install 'apt-file' ('apter install apt-file') to search all repository packages (including uninstalled)." >&2
             fi
         fi
     done

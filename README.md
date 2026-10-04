@@ -8,12 +8,12 @@ It focuses on providing a clean, fast, UNIX-style CLI experience without the clu
 
 ## Key Features
 
-- **Noise-Free Anchored Search**: `apter search` anchors search queries to primary package names and versioned variants (e.g. `clang` returns `clang` and `clang-19`, filtering out `clangd` or `libclang-dev`). Supports unanchored search (`-a`) when desired.
+- **All-Repository Package Search**: `apter search` searches across all repository package names and descriptions by default, highlighting installed packages in green.
 - **Shell Glob Expansion**: Native shell glob pattern matching (`*`, `?`, `[...]`) across matching commands (`info`, `search`, `what`).
 - **Clean Package Info**: `apter info` strips technical hashes, maintainers, and build metadata, showing only plain-text descriptions alongside `Installed` vs `Candidate` versions.
 - **World File Package Tracking**: `apter install` and `apter remove` require exact package names (no wildcards) and track your explicitly installed software in `${XDG_STATE_HOME:-~/.local/state}/apter_world.log` (or `~/.apter_world.log`).
-- **Curbed, Deterministic Output**: Installation and removal operations force `LC_ALL=C -q=2` and stream-filter output to highlight installation/configuration actions without walls of technical status text.
-- **File Ownership & Contents**: Instantly find which package installed a command or file (`apter who`), or list files installed by a package (`apter what`).
+- **Curbed, Deterministic Output**: Package installation, removal, update, and upgrade operations force `LC_ALL=C -o Dpkg::Progress-Fancy=1` with stream-filtered output to show clean actions alongside a terminal progress bar.
+- **All-Repository File Ownership**: Instantly find which package provides a command or file across all repository packages (`apter who`).
 - **Clean History Timeline**: Parses `/var/log/apt/history.log` into an easy-to-read chronological timeline.
 
 ---
@@ -33,12 +33,11 @@ sudo cp apter /usr/local/bin/
 
 ## Command Reference
 
-### `apter search [options] <query>`
-Searches the package index. Anchored by default to prevent package clutter.
+### `apter search <query>`
+Searches all repository package names and descriptions.
 ```bash
-apter search clang               # Search for 'clang' and versioned variants (clang-14..clang-20)
+apter search clang               # Search for packages matching 'clang'
 apter search 'clang-*'           # Search using shell glob pattern matching
-apter search -a vim              # Broad search across names and descriptions
 ```
 
 ### `apter info <package|glob...>`
@@ -88,7 +87,7 @@ apter orphans --clean            # Cleanly remove orphaned packages (or 'apter a
 ```
 
 ### `apter who <file|command...>`
-Finds which package installed a given file or binary command.
+Finds which package provides a given file or command across all repository packages (using `apt-file`).
 ```bash
 apter who /usr/bin/gcc           # Returns package 'gcc'
 apter who bash                   # Resolves command in $PATH and returns package 'bash'
