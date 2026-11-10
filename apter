@@ -466,8 +466,9 @@ EOF
         fi
     done
 
-    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output; then
-        local status=$?
+    local status=0
+    LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 install "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_install_output || status=$?
+    if [[ $status -ne 0 ]]; then
         echo "Installation failed." >&2
         return $status
     fi
@@ -540,8 +541,9 @@ EOF
         action_flag="purge"
     fi
 
-    if ! LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output; then
-        local status=$?
+    local status=0
+    LC_ALL=C sudo apt-get -q=2 -o Dpkg::Use-Pty=0 "$action_flag" "${apt_opts[@]}" "${pkgs[@]}" 2>&1 | filter_apt_remove_output || status=$?
+    if [[ $status -ne 0 ]]; then
         echo "Removal failed." >&2
         return $status
     fi
@@ -647,7 +649,7 @@ EOF
     local upgradable=()
     while IFS= read -r line; do
         if [[ "$line" =~ ^Inst\ ([^[:space:]]+)\ \[([^\]]+)\]\ \(([^[:space:]]+) ]]; then
-            upgradable+=("${BASH_REMATCH[1]}\t${BASH_REMATCH[2]}\t${BASH_REMATCH[3]}")
+            upgradable+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"$'\t'"${BASH_REMATCH[3]}")
         fi
     done <<< "$upgrade_out"
 
@@ -692,7 +694,7 @@ cmd_orphans() {
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            -t|--target-release|--default-release|-o|--option|-c|--config-file|-a|--architecture)
+            -t|--target-release|--default-release|-o|--option|--config-file|-a|--architecture)
                 if [[ $# -gt 1 ]]; then
                     apt_opts+=("$1" "$2")
                     shift 2
@@ -739,7 +741,7 @@ EOF
     local orphans=()
     while IFS= read -r line; do
         if [[ "$line" =~ ^Remv\ ([^[:space:]]+)\ \(([^[:space:]]+) ]]; then
-            orphans+=("${BASH_REMATCH[1]}\t${BASH_REMATCH[2]}")
+            orphans+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}")
         fi
     done <<< "$auto_out"
 
